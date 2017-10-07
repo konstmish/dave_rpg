@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-#!/usr/bin/env python
 
 """
 Master that controls prox-grad algorithm
@@ -29,7 +28,7 @@ signal.signal(SIGPIPE, SIG_DFL)
 
 random.seed = 0
 
-C = 0
+C = 6
 
 penalty_size_by_data = {'rcv1': 3e-6, 'url': 1e-8, 'news': 1e-6}
 
@@ -40,13 +39,14 @@ def master_print(*args, **kw_args):
 class Master(object):
     """ Communications are done using select """
     
-    def __init__(self, n_slaves, algo, data_name, cross_val, port=8888, backlog=50):
+    def __init__(self, n_slaves, algo, data_name, cross_val, port=8888, backlog=50, path=''):
         self.M = n_slaves
         self.algo = algo
         self.cross_val = cross_val
         self.connected_slaves = 0
         self.port = port
         self.data_name = data_name
+        self.path = path
         # Client map
         self.numerate_map = {}
         # Output socket list
@@ -65,7 +65,7 @@ class Master(object):
 
     def read_data(self):
         master_print('Reading the data')
-        self.A, self.b = get_data(self.data_name)
+        self.A, self.b = get_data(self.data_name, self.path)
         self.b = csr_matrix(self.b).T
         self.n = self.b.shape[0]
         master_print('The data is read. There are', self.n, 'observations and', self.A.shape[1], 'features.')
@@ -78,7 +78,8 @@ class Master(object):
         s.close()
         master_print('The ip is', ip)
         self.ip = ip
-        master_print('To run a slave, type python3 slave.py', self.ip, '--port', self.port)
+        with open(self.path + 'ip', 'w') as f:
+            f.write(str(ip))
         
     def sighandler(self, signum, frame):
         master_print('Shutting down server...')
@@ -97,11 +98,7 @@ class Master(object):
             start_idx = sep_idx[i]
             end_idx   = sep_idx[i + 1]
             master_print(end_idx - start_idx, 'points go to slave', i + 1)
-            save_data_for_slave(self.A, self.b, start_idx, end_idx, i + 1)
-            
-        for i in range(self.M):
-            slave_can_read = True
-            send(self.outputs[i], [slave_can_read, self.A.shape[1]])
+            save_data_for_slave(self.A, self.b, start_idx, end_idx, i + 1, self.path)
             
     def get_x_hat(self, x_bar=None):
         if x_bar is None:
@@ -120,11 +117,13 @@ class Master(object):
             x_hat = self.get_x_hat()
         return 'sparsity of x: ' + "{:.3f}".format(1 - x_hat.count_nonzero() / x_hat.shape[0])
 
-    def print_summary(self, it=None, start=None, end=None, prefix='Current', print_sparsity=True, final=False):
+    def print_summary(self, it=None, start=None, end=None, prefix='Current', print_sparsity=True, final=False, max_delay=None):
         x_hat = self.x if self.algo in ['asynch_ave', 'daga'] else self.get_x_hat()
         to_print = prefix + ' loss: ' + str(self.get_objective_value(x_hat))
         if print_sparsity:
             to_print += ', ' + self.get_sparsity(x_hat)
+        if max_delay is not None and self.algo != 'synch_gd':
+            to_print += ', maximal delay: ' + str(max_delay)
         master_print(to_print, end='\r' if not final else '\n')
         if final:
             master_print('It took %d iterations' % it, 'and', end - start, 'sec')
@@ -141,8 +140,7 @@ class Master(object):
         if self.algo == 'asynch_ave':
             first_option = 16 * ( (1 + self.l2 / (48 * self.L) ) ** (1 / self.M) - 1 ) / self.l2
             second_option = ( (1 + self.l2 / (self.M * self.L) ) ** (1 / self.M) - 1 ) / self.l2
-            master_print('Two upper bounds on the stepsize are', first_option, 'and', second_option)
-            self.gamma = max(first_option, second_option)
+            self.gamma = 2 * max(first_option, second_option)
         else:
             self.gamma = 2 / (self.L + 2 * self.l2)
         self.x = csr_matrix(np.zeros(self.A.shape[1])).T
@@ -158,23 +156,22 @@ class Master(object):
         
     def save_values_history(self):
         master_print('Computing and saving intermediate values...')
-        if self.cross_val:
-            self.A, self.b = get_test_data(self.data_name)
-            self.b = csr_matrix(self.b).T
-            self.n = self.b.shape[0]
-        step = max(1, len(self.iterates) // 1000)
         if self.algo == 'asynch_gd':
-            x_hats = [self.get_x_hat(iterate) for iterate in self.iterates[::step]]
+            x_hats = [self.get_x_hat(iterate) for iterate in self.iterates[::]]
         else:
-            x_hats = self.iterates[::step]
-        # x_hat = iterate if self.algo in ['synch_gd', 'asynch_ave', 'daga'] else self.get_x_hat(iterate)
-        # values.append(self.get_objective_value(x_hat))
-        # values = Parallel(n_jobs=-1)(delayed(self.get_objective_value)(x_hat) for x_hat in x_hats)
-        
+            x_hats = self.iterates
         self.values += [self.get_objective_value(x_hat) for x_hat in x_hats]
-        
-        pickle.dump(self.values, open('logs_' + self.data_name + '/values_' + self.algo + '.p', 'wb'))
-        pickle.dump(self.times[::step], open('logs_' + self.data_name + '/times_' + self.algo + '.p', 'wb'))
+        pickle.dump(self.values, open(self.path + 'logs_' + self.data_name + '/values_' + self.algo + '.p', 'wb'))
+        pickle.dump(self.times, open(self.path + 'logs_' + self.data_name + '/times_' + self.algo + '.p', 'wb'))
+
+        if not self.cross_val:
+            return
+        self.A, self.b = get_test_data(self.data_name, self.path)
+        self.b = csr_matrix(self.b).T
+        self.n = self.b.shape[0]
+        self.values = self.values[0] + [self.get_objective_value(x_hat) for x_hat in x_hats]
+        pickle.dump(self.values, open(self.path + 'logs_' + self.data_name + '/values_' + self.algo + '_test.p', 'wb'))
+        pickle.dump(self.delays, open(self.path + 'logs_' + self.data_name + '/delays_' + self.algo + '.p', 'wb'))
         
     def inform_slaves(self, message):
         master_print('Informing slaves...')
@@ -191,8 +188,8 @@ class Master(object):
                 self.outputs = [outp for outp in self.outputs if outp != s]
             slave_informed += 1
         
-    def wait_until_all_slave_get_data(self):
-        self.inputs = [self.server, sys.stdin]
+    def wait_until_all_slaves_connect(self):
+        self.inputs = [self.server]
         self.outputs = []
         while self.connected_slaves < self.M:
             try:
@@ -202,8 +199,7 @@ class Master(object):
             except socket.error as e:
                 break
             
-            for s in inputready:
-            
+            for s in inputready:  
                 if s == self.server:
                     # handle the server socket
                     slave, address = self.server.accept()
@@ -216,15 +212,11 @@ class Master(object):
                     self.inputs.append(slave)
                     
                     self.outputs.append(slave)
-
-                elif s == sys.stdin:
-                    # handle standard input
-                    junk = sys.stdin.readline()
-                    break
-            
-            if self.connected_slaves == self.M:
-                self.distribute_data()
-                return
+                    
+        for i in range(self.M):
+            slave_can_read = True
+            send(self.outputs[i], [slave_can_read, self.A.shape[1]])
+        return
                 
     def work_until_condition(self, max_iter, save_values, print_state):
         norms = np.ones(self.M)
@@ -232,50 +224,55 @@ class Master(object):
         slaves_waiting = 0
         stop_condition = False
         start = time.time()
+        delays = [0 for i in range(self.M)]
+        max_delay = 0
+        iter_step = max(1, max_iter // 1000)
+        self.max_delays = []
         while not stop_condition:
-            data_and_socket = wait_to_get_data_from_slaves(self.inputs, self.outputs, self.server)
+            data_and_socket = wait_to_get_data_from_slaves(self.inputs, self.outputs, self.server, self.numerate_map, delays)
+            if not data_and_socket:
+                continue
             if self.algo != 'synch_gd':
                 it += 1
             if not print_state:
-                master_print('Iteration:', it, end='\r' if it < max_iter else '\n')
-            if data_and_socket is None:
-                break
+                to_print = ', current max delay: ' + str(max_delay) if self.algo != 'synch_gd' else ''
+                master_print('Iteration: ' + str(it) + to_print, end='\r' if it < max_iter else '\n')
             data, s = data_and_socket
-            delta_x, delta_grad = data
-            self.alpha += delta_grad
-            self.x = self.get_x_hat(self.x + delta_x)
-            # if self.algo in ['asynch_ave', 'daga', 'daga2']:
-#                 delta_x, delta_grad = data
-#                 self.alpha += delta_grad
-#             else:
-#                 delta_x = data
-#
-#             self.x += delta_x
-#             if self.algo in ['asynch_ave', 'daga']:
-#                 self.x = self.get_x_hat()
+            if self.algo in ['asynch_ave', 'daga', 'daga2']:
+                delta_x, delta_grad = data
+                self.alpha += delta_grad
+            else:
+                delta_x = data
+
+            self.x += delta_x
+            if self.algo in ['asynch_ave', 'daga']:
+                self.x = self.get_x_hat()
                 
-            if self.algo != 'synch_gd' and save_values:
+            if self.algo != 'synch_gd' and save_values and it % iter_step == 0:
                 self.iterates.append(self.x)
                 self.times.append(time.time() - start)
             
-            send(s, [self.x, self.alpha])
-            
             # Send updated values in response
-            # if self.algo != 'synch_gd':
-            #     data = [self.x, self.alpha] if self.algo in ['asynch_ave', 'daga', 'daga2'] else self.x
-            #     send(s, data)
-            # else:
-            #     slaves_waiting += 1
+            if self.algo != 'synch_gd':
+                data = [self.x, self.alpha] if self.algo in ['asynch_ave', 'daga', 'daga2'] else self.x
+                send(s, data)
+            else:
+                slaves_waiting += 1
             
+
+            delays = [d + 1 for d in delays]
+            delays[self.numerate_map[s]] = 0
+            max_delay = max(delays)
+            self.max_delays.append(max_delay)
             N = 10 * (self.M - (self.M - 1) * (self.algo == 'synch_gd'))
             if print_state and it % N == 0:
-                self.print_summary()
+                self.print_summary(max_delay=max_delay)
                 
             if self.algo == 'synch_gd' and slaves_waiting == self.M:
                 it += self.M
-                if save_values:
+                if save_values and it % iter_step == 0:
                     self.iterates.append(self.x)
-                self.times.append(time.time() - start)
+                    self.times.append(time.time() - start)
                 for i in range(self.M):
                     send(self.outputs[i], self.x)
                 slaves_waiting = 0
@@ -292,8 +289,10 @@ class Master(object):
                 self.save_values_history()
     
     def optimize(self, max_iter, save_values, print_state):
+        max_iter = max_iter * self.M
         self.read_data()
-        self.wait_until_all_slave_get_data()
+        self.distribute_data()
+        self.wait_until_all_slaves_connect()
         
         algos = ['asynch_ave', 'synch_gd', 'asynch_gd'] if self.algo == 'all' else [self.algo]
         for j, algo in enumerate(algos):
@@ -314,11 +313,11 @@ class Master(object):
             s.close()
         self.server.close()
         
-        remove_tmp_files(self.M)
+        remove_tmp_files(self.M, self.path)
 
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description='Run parametric server for distributed optimization')
-    parser.add_argument('n_slaves', action='store', type=int, help='Number of workers excluding the server')
+    parser.add_argument('--n_slaves', action='store', type=int, help='Number of workers excluding the server')
     parser.add_argument('--max_it', action='store', dest='max_it', type=int, default=200, help='Max number of iterations')
     parser.add_argument('-p', action='store_true', default=False, help='Print progress')
     parser.add_argument('--port', action='store', default = 8888, type=int, help='Server\'s port')
@@ -327,6 +326,7 @@ if __name__ == "__main__":
                         help='Algorithms: asynchronous/synchronous gradient descent, asynchronous average gradient, DAGA')
     parser.add_argument('--data', action='store', dest='data', default = 'rcv1', help='Name of the dataset that should be used')
     parser.add_argument('--cv', action='store_true', default=False, help='Use test set to evaluate performance')
+    parser.add_argument('--path', action='store', default='', help='Path to the data')
     
     configuration = read_config()
     if configuration is not None:
@@ -334,4 +334,4 @@ if __name__ == "__main__":
     else:
         results = parser.parse_args()
     
-    Master(results.n_slaves, results.algo, results.data, results.cv, port=results.port).optimize(results.max_it, results.v, results.p)
+    Master(results.n_slaves, results.algo, results.data, results.cv, port=results.port, path=results.path).optimize(results.max_it, results.v, results.p)
