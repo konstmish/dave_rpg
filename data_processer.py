@@ -3,8 +3,9 @@ from sklearn.datasets import load_svmlight_file, dump_svmlight_file
 from numpy import savez
 import os.path
 
-datasets_map = {'rcv1': 'rcv1_train', 'url': 'url_combined', 'news': 'news20.binary',
-                'rcv1_test': 'rcv1_test.binary'}
+datasets_map = {'rcv1': 'rcv1_train', 'url': 'url_combined', 'news': 'news20.binary',  'criteo': 'criteo.kaggle2014.train.svm',
+                'rcv1_test': 'rcv1_test.binary', 'criteo_test': 'criteo.te.svm', 'covtype': 'covtype.libsvm.binary',
+                'YearPredictionMSD': 'YearPredictionMSD'}
 
 def get_data(data_name='rcv1', path=''):
     data = load_svmlight_file(path + datasets_map[data_name], zero_based=True)

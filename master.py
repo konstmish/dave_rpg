@@ -15,7 +15,6 @@ import pickle
 import sys
 import argparse
 
-# from joblib import Parallel, delayed
 from communication import send, receive, wait_to_get_data_from_slaves
 from functions import F, prox_r
 from data_processer import get_data, get_test_data, save_data_for_slave, remove_tmp_files, read_config
@@ -28,9 +27,11 @@ signal.signal(SIGPIPE, SIG_DFL)
 
 random.seed = 0
 
-C = 6
+C = 0
+MAX_T = 500
 
-penalty_size_by_data = {'rcv1': 3e-6, 'url': 1e-8, 'news': 1e-6}
+penalty_size_by_data = {'rcv1': 3e-6, 'url': 1e-6, 'news': 1e-6, 'criteo': 1e-11, 'covtype': 1e-10, 'YearPredictionMSD': 1e-10}
+smoothness_by_data = {'rcv1': 0.25, 'url': 128.4, 'criteo': 1.25, 'covtype': 21930585.25, 'YearPredictionMSD': 1355448761.5017424, 'news': 0.25002293537100007}
 
 def master_print(*args, **kw_args):
     print('Master:', end= ' ')
@@ -118,15 +119,15 @@ class Master(object):
         return 'sparsity of x: ' + "{:.3f}".format(1 - x_hat.count_nonzero() / x_hat.shape[0])
 
     def print_summary(self, it=None, start=None, end=None, prefix='Current', print_sparsity=True, final=False, max_delay=None):
-        x_hat = self.x if self.algo in ['asynch_ave', 'daga'] else self.get_x_hat()
+        x_hat = self.x if self.algo in ['asynch_ave', 'saga'] else self.get_x_hat()
         to_print = prefix + ' loss: ' + str(self.get_objective_value(x_hat))
         if print_sparsity:
             to_print += ', ' + self.get_sparsity(x_hat)
         if max_delay is not None and self.algo != 'synch_gd':
-            to_print += ', maximal delay: ' + str(max_delay)
+            to_print += ', maximal delay: ' + str(max_delay) + '    '
         master_print(to_print, end='\r' if not final else '\n')
         if final:
-            master_print('It took %d iterations' % it, 'and', end - start, 'sec')
+            master_print('It took %d iterations' % it, 'or', end - start, 'sec')
             
     def initialize_algorithm(self, first_time=True):
         self.tol = 1e-10
@@ -137,10 +138,13 @@ class Master(object):
         self.iterates = []
         if first_time:
             self.L = 0.25 * np.max(self.A.multiply(self.A).sum(axis=1))
+        # self.L = smoothness_by_data[self.data_name]
         if self.algo == 'asynch_ave':
             first_option = 16 * ( (1 + self.l2 / (48 * self.L) ) ** (1 / self.M) - 1 ) / self.l2
             second_option = ( (1 + self.l2 / (self.M * self.L) ) ** (1 / self.M) - 1 ) / self.l2
-            self.gamma = 2 * max(first_option, second_option)
+            self.gamma = max(first_option, second_option)
+        elif self.algo == 'saga':
+            self.gamma = min(1 / (36 * self.L), self.l2 / (6 * self.M))
         else:
             self.gamma = 2 / (self.L + 2 * self.l2)
         self.x = csr_matrix(np.zeros(self.A.shape[1])).T
@@ -154,39 +158,49 @@ class Master(object):
         print('It takes', time.time() - start, 'second to compute current value')
         master_print('Initial value:', initial_value, 'smoothness:', self.L, 'stepsize:', self.gamma)
         
-    def save_values_history(self):
+    def save_values_history(self, p):
         master_print('Computing and saving intermediate values...')
+        suffix = '_' + self.algo
         if self.algo == 'asynch_gd':
-            x_hats = [self.get_x_hat(iterate) for iterate in self.iterates[::]]
+            x_hats = [self.get_x_hat(iterate) for iterate in self.iterates]
+            suffix += '_' + str(p)
         else:
             x_hats = self.iterates
+        suffix += '.p'
         self.values += [self.get_objective_value(x_hat) for x_hat in x_hats]
-        pickle.dump(self.values, open(self.path + 'logs_' + self.data_name + '/values_' + self.algo + '.p', 'wb'))
-        pickle.dump(self.times, open(self.path + 'logs_' + self.data_name + '/times_' + self.algo + '.p', 'wb'))
+        prefix = self.path + 'logs_' + self.data_name + '/'
+        # pickle.dump(x_hats, open(prefix + 'iterates' + suffix, 'wb'))
+        pickle.dump(self.values, open(prefix + 'values' + suffix, 'wb'))
+        pickle.dump(self.times, open(prefix + 'times' + suffix, 'wb'))
 
         if not self.cross_val:
             return
+        pickle.dump(self.max_delays, open(prefix + 'delays' + suffix, 'wb'))
         self.A, self.b = get_test_data(self.data_name, self.path)
         self.b = csr_matrix(self.b).T
         self.n = self.b.shape[0]
+        self.l2 = 0
+        self.l1 = 0
         self.values = self.values[0] + [self.get_objective_value(x_hat) for x_hat in x_hats]
-        pickle.dump(self.values, open(self.path + 'logs_' + self.data_name + '/values_' + self.algo + '_test.p', 'wb'))
-        pickle.dump(self.delays, open(self.path + 'logs_' + self.data_name + '/delays_' + self.algo + '.p', 'wb'))
+        pickle.dump(self.values, open(prefix + 'values_test' + suffix, 'wb'))
         
     def inform_slaves(self, message):
         master_print('Informing slaves...')
-        slave_informed = 0
-        while slave_informed < self.M:
-            data_and_socket = wait_to_get_data_from_slaves(self.inputs, self.outputs, self.server)
-            if data_and_socket is None:
-                break
-            data, s = data_and_socket
+        slaves_informed = 0
+        while slaves_informed < self.M:
+            if self.algo != 'synch_gd':
+                data_and_socket = wait_to_get_data_from_slaves(self.inputs, self.outputs, self.server)
+                if data_and_socket is None:
+                    break
+                data, s = data_and_socket
+            else:
+                s = self.outputs[slaves_informed]
             send(s, message)
             if (message == 'Terminate'):
                 s.close()
                 self.inputs = [inp for inp in self.inputs if inp != s]
                 self.outputs = [outp for outp in self.outputs if outp != s]
-            slave_informed += 1
+            slaves_informed += 1
         
     def wait_until_all_slaves_connect(self):
         self.inputs = [self.server]
@@ -226,7 +240,7 @@ class Master(object):
         start = time.time()
         delays = [0 for i in range(self.M)]
         max_delay = 0
-        iter_step = max(1, max_iter // 1000)
+        iter_step = max(1, max_iter // 100)
         self.max_delays = []
         while not stop_condition:
             data_and_socket = wait_to_get_data_from_slaves(self.inputs, self.outputs, self.server, self.numerate_map, delays)
@@ -235,85 +249,90 @@ class Master(object):
             if self.algo != 'synch_gd':
                 it += 1
             if not print_state:
-                to_print = ', current max delay: ' + str(max_delay) if self.algo != 'synch_gd' else ''
+                to_print = ', current max delay: ' + str(max_delay) + '   ' if self.algo != 'synch_gd' else ''
                 master_print('Iteration: ' + str(it) + to_print, end='\r' if it < max_iter else '\n')
             data, s = data_and_socket
-            if self.algo in ['asynch_ave', 'daga', 'daga2']:
+            if self.algo in ['asynch_ave', 'saga']:
                 delta_x, delta_grad = data
                 self.alpha += delta_grad
             else:
                 delta_x = data
 
             self.x += delta_x
-            if self.algo in ['asynch_ave', 'daga']:
+            if self.algo in ['asynch_ave', 'saga']:
                 self.x = self.get_x_hat()
                 
             if self.algo != 'synch_gd' and save_values and it % iter_step == 0:
                 self.iterates.append(self.x)
                 self.times.append(time.time() - start)
+            self.max_delays.append(max_delay)
             
             # Send updated values in response
             if self.algo != 'synch_gd':
-                data = [self.x, self.alpha] if self.algo in ['asynch_ave', 'daga', 'daga2'] else self.x
+                data = [self.x, self.alpha] if self.algo in ['asynch_ave', 'saga'] else self.x
                 send(s, data)
             else:
                 slaves_waiting += 1
-            
 
             delays = [d + 1 for d in delays]
             delays[self.numerate_map[s]] = 0
             max_delay = max(delays)
-            self.max_delays.append(max_delay)
             N = 10 * (self.M - (self.M - 1) * (self.algo == 'synch_gd'))
             if print_state and it % N == 0:
-                self.print_summary(max_delay=max_delay)
+                self.print_summary(it=it, max_delay=max_delay)
                 
             if self.algo == 'synch_gd' and slaves_waiting == self.M:
                 it += self.M
                 if save_values and it % iter_step == 0:
                     self.iterates.append(self.x)
                     self.times.append(time.time() - start)
+                stop_condition = time.time() - start > MAX_T
+                if stop_condition:
+                    break
                 for i in range(self.M):
                     send(self.outputs[i], self.x)
                 slaves_waiting = 0
             
             norms[self.numerate_map[s]] = norm(delta_x)
-            stop_condition = max(norms) * self.M < self.tol or it >= max_iter
-            if stop_condition:
-                break
+            # stop_condition = max(norms) * self.M < self.tol or it >= max_iter * (1 + (self.algo == 'asynch_gd'))
+            if self.algo != 'synch_gd':
+                stop_condition = time.time() - start > MAX_T
             
         if stop_condition:
             end = time.time()
             self.print_summary(it, start, end, prefix='Final', final=True)
-            if save_values:
-                self.save_values_history()
     
-    def optimize(self, max_iter, save_values, print_state):
+    def optimize(self, max_iter, save_values, print_state, p_min, p_max):
         max_iter = max_iter * self.M
         self.read_data()
         self.distribute_data()
         self.wait_until_all_slaves_connect()
         
-        algos = ['asynch_ave', 'synch_gd', 'asynch_gd'] if self.algo == 'all' else [self.algo]
-        for j, algo in enumerate(algos):
-            self.algo = algo
-            self.initialize_algorithm(j == 0)
-            master_print('Sending parameters...')
-            for i in range(self.M):
-                send(self.outputs[i], [self.x, self.M, self.gamma, self.l2, self.l1, self.n, self.algo, self.data_name])
-            master_print('Start optimizing using', self.algo)
-            self.work_until_condition(max_iter, save_values, print_state)
-            if j < len(algos) - 1:
-                self.inform_slaves('Change algorithm')
-            else:
-                self.inform_slaves('Terminate')
-            master_print('Finished optimizing using', self.algo)
+        algos = ['asynch_ave', 'synch_gd', 'asynch_gd', 'saga'] if self.algo == 'all' else [self.algo]
+        for p in range(p_min, p_max + 1):
+            for j, algo in enumerate(algos):
+                if p != p_min and self.algo != 'asynch_gd':
+                    continue
+                self.algo = algo
+                self.initialize_algorithm(j == 0)
+                master_print('Sending parameters...')
+                for i in range(self.M):
+                    send(self.outputs[i], [self.x, self.M, self.gamma, self.l2, self.l1, self.n, self.algo, self.data_name, p])
+                master_print('Start optimizing using', self.algo)
+                self.work_until_condition(max_iter, save_values, print_state)
+                if j < len(algos) - 1 or p < p_max:
+                    self.inform_slaves('Change algorithm')
+                else:
+                    self.inform_slaves('Terminate')
+                master_print('Finished optimizing using', self.algo)
+                if save_values:
+                    self.save_values_history(p)
                     
         for s in self.inputs:
             s.close()
         self.server.close()
         
-        remove_tmp_files(self.M, self.path)
+        #remove_tmp_files(self.M, self.path)
 
 if __name__ == "__main__":    
     parser = argparse.ArgumentParser(description='Run parametric server for distributed optimization')
@@ -322,16 +341,17 @@ if __name__ == "__main__":
     parser.add_argument('-p', action='store_true', default=False, help='Print progress')
     parser.add_argument('--port', action='store', default = 8888, type=int, help='Server\'s port')
     parser.add_argument('-v', action='store_true', default=False, help='Save produced values to a file')
-    parser.add_argument('--algo', action='store', dest='algo', choices=['asynch_gd', 'synch_gd', 'asynch_ave', 'daga', 'daga2', 'all'],
+    parser.add_argument('--algo', action='store', dest='algo', choices=['asynch_gd', 'synch_gd', 'asynch_ave', 'saga', 'all'],
                         help='Algorithms: asynchronous/synchronous gradient descent, asynchronous average gradient, DAGA')
     parser.add_argument('--data', action='store', dest='data', default = 'rcv1', help='Name of the dataset that should be used')
     parser.add_argument('--cv', action='store_true', default=False, help='Use test set to evaluate performance')
     parser.add_argument('--path', action='store', default='', help='Path to the data')
+    parser.add_argument('--reps', action='store', default='1:1', help='Number of iterations in the inner loop')
     
     configuration = read_config()
     if configuration is not None:
         results = parser.parse_args(configuration)
     else:
         results = parser.parse_args()
-    
-    Master(results.n_slaves, results.algo, results.data, results.cv, port=results.port, path=results.path).optimize(results.max_it, results.v, results.p)
+    p_min, p_max = int(results.reps.split(':')[0]), int(results.reps.split(':')[1])
+    Master(results.n_slaves, results.algo, results.data, results.cv, port=results.port, path=results.path).optimize(results.max_it, results.v, results.p, p_min, p_max)
